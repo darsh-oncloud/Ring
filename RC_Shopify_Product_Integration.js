@@ -1,6 +1,6 @@
 /**
  * ===========================
- * FILE 1: MR SCRIPT (FULL UPDATED)
+ * FILE 1: MR SCRIPT (FULL. UPDATED)
  * ===========================
  * @NApiVersion 2.1
  * @NScriptType MapReduceScript
