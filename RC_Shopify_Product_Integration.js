@@ -585,7 +585,7 @@ function buildMetafields(mfi) {
           values: {
             custitem_rc_shopify_product_id: String(parentPid),
             custitem_ring_shopify_item_id: String(vid),
-            //custitem_ag_barcode: String(vid),
+            custitem_ag_barcode: String(vid),
             custitem_rc_send_to_shopify: false,
             custitem_rc_send_to_pfs: 2
           }
