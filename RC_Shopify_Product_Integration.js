@@ -1,6 +1,6 @@
 /**
  * ===========================
- * FILE 1: MR SCRIPT (FULL. UPDATED)
+ * FILE 1: MR SCRIPT (FULL UPDATED)
  * ===========================
  * @NApiVersion 2.1
  * @NScriptType MapReduceScript
@@ -200,6 +200,7 @@ function(record, search, log, runtime, shopify) {
       // Build bulk payload for this product
       var updates = [];
       var toUncheck = []; // [{ itemId, type }]
+      var updateItems = []; // same index as updates
       for (var i = 0; i < rows.length; i++) {
         var r = rows[i];
 
@@ -225,6 +226,13 @@ function(record, search, log, runtime, shopify) {
           variantId: String(vid),
           price: r.price,
           compareAtPrice: (r.compareAtPrice === null ? null : r.compareAtPrice)
+        });
+
+        updateItems.push({
+          itemId: r.itemId,
+          type: r.type,
+          sku: r.sku,
+          variantId: String(vid)
         });
 
         toUncheck.push({ itemId: r.itemId, type: r.type });
@@ -258,6 +266,51 @@ function(record, search, log, runtime, shopify) {
       if (!bulkRes || bulkRes.ok !== true) {
         failed += updates.length;
         log.error('PRICE:bulk-failed', { productId: productIdStr, res: bulkRes });
+
+        try {
+          var failedProducts = (bulkRes && bulkRes.failedProducts) || [];
+          var userErrors = (failedProducts[0] && failedProducts[0].userErrors) || [];
+
+          for (var e = 0; e < userErrors.length; e++) {
+            var err = userErrors[e];
+            var fieldArr = err.field || [];
+            var msg = err.message || '';
+            var idx = null;
+
+            if (fieldArr.length >= 2 && fieldArr[0] === 'variants') {
+              idx = parseInt(fieldArr[1], 10);
+            }
+
+            if (
+              msg === 'Product variant does not exist' &&
+              idx !== null &&
+              !isNaN(idx) &&
+              updateItems[idx]
+            ) {
+              var badRow = updateItems[idx];
+
+              log.audit('PRICE:item-checkbox-unchecked', {
+                productId: productIdStr,
+                index: idx,
+                itemId: badRow.itemId,
+                sku: badRow.sku,
+                variantId: badRow.variantId,
+                reason: msg
+              });
+
+              record.submitFields({
+                type: shopify.getType(badRow.type),
+                id: badRow.itemId,
+                values: {
+                  custitem_shopify_price_update: false
+                }
+              });
+            }
+          }
+        } catch (mapErr) {
+          log.error('PRICE:error-mapping-failed', mapErr);
+        }
+
         log.audit('PRICE:done', { productId: productIdStr, totalRows: rows.length, ok: ok, failed: failed });
         return;
       }
