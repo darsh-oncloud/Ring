@@ -14,6 +14,8 @@ define(['N/search', 'N/record', 'N/log'], function (search, record, log) {
     return search.create({
       type: 'customrecord_inventory_snapshot_entry',
       filters: [
+        ["created","on","today"],
+        'AND',
         ['custrecord_rc_ins_status', 'anyof', '2'],
         'AND',
         ['custrecord_qunatity_on_hand', 'isnotempty', ''],
