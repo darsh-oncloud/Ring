@@ -458,19 +458,23 @@ function buildMetafields(mfi) {
         // UPDATE parent title (NO price)
         // try { shopify.updateProductInfo(String(pid), String(row.displayName), undefined); } catch (e0) {}
 
-        log.audit('FULL:parent-title-update-attempt', {
-  itemId: row.itemId,
-  productId: pid,
-  titleSendingToShopify: row.displayName
-});
-
 try {
-  shopify.updateProductInfo(String(pid), String(row.displayName), undefined);
+  var updateRes = shopify.updateProductInfo(String(pid), String(row.displayName), undefined);
+
+  log.audit('FULL:parent-title-update-response', {
+    productId: pid,
+    title: row.displayName,
+    response: updateRes
+  });
+
 } catch (e0) {
   log.error('FULL:parent-title-update-failed', {
     productId: pid,
     title: row.displayName,
-    error: e0
+    errorName: e0.name || '',
+    errorMessage: e0.message || '',
+    errorStack: e0.stack || '',
+    errorString: JSON.stringify(e0)
   });
 }
         
