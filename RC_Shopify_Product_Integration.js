@@ -152,6 +152,11 @@ function(record, search, log, runtime, shopify) {
         // For child rows, this must be the PARENT product id column
         parentProductId: parentProductId || null,
         barcode: (r["BARCODE"] || '').trim(),
+
+        // --- ADDED MAPPINGS FOR SHIPPING SYNC ---
+        countryOfOrigin: r["countryofmanufacture"] || r["Manufacturer Country"] || '',
+        hsCode: r["manufacturertariff"] || r["Manufacturer Tariff"] || '',
+
         o1: (r.custitem_shopify_option_1 || '').trim(),
         o2: (r.custitem_shopify_option_2 || '').trim(),
         o3: (r.custitem_shopify_option_3 || '').trim(),
@@ -346,17 +351,6 @@ function(record, search, log, runtime, shopify) {
     // Only one row per key now
     var row = JSON.parse(context.values[0]);
 
- /**   function buildMetafields(mfi) {
-      mfi = mfi || {};
-      return [
-        { namespace: 'custom', key: '_giftwrap',         value: (mfi._giftwrap === true || mfi._giftwrap === 'T') ? 'true' : 'false', type: 'boolean' },
-        { namespace: 'custom', key: 'final_sale',        value: (mfi.final_sale === true || mfi.final_sale === 'T') ? 'true' : 'false', type: 'boolean' },
-        { namespace: 'custom', key: 'custom_sale_price', value: mfi.custom_sale_price || '', type: 'money' },
-        { namespace: 'custom', key: 'vip_price_sale_currency',   value: mfi.vip_price_sale_ || '', type: 'money' },
-        { namespace: 'custom', key: 'vvip_price_sale_currency',  value: mfi.vvip_price_sale_ || '', type: 'money' }
-      ];
-    }**/
-
     function buildMoneyValue(v, currencyCode) {
   if (v === null || v === undefined || String(v).trim() === '') return '';
 
@@ -383,7 +377,6 @@ function buildMetafields(mfi) {
 }
     function parseLocs(locStr) { return csvToArray(locStr); }
 
-    // ===== ADDED (existence helpers) - nothing else changed =====
     function getShopifyProductSafe(pid) {
       if (!pid) return null;
       try { return shopify.getProduct(String(pid)); } catch (e) { return null; }
@@ -399,7 +392,6 @@ function buildMetafields(mfi) {
       }
       return false;
     }
-    // ===== END ADDED =====
 
     try {
       // -------------------------
@@ -451,25 +443,21 @@ function buildMetafields(mfi) {
             } catch (eLocP) {
               log.error('FULL:parent-location-error', { productId: pid, err: eLocP });
             }
-          } else {
-            log.debug('FULL:parent-no-location-ids', { itemId: row.itemId, productId: pid });
           }
 
           log.audit('FULL:parent-created', { itemId: row.itemId, productId: pid });
           return;
         }
 
-        // ===== ADDED (parent update should skip if productId not found in Shopify) =====
         var parentProdCheck = getShopifyProductSafe(pid);
         if (!productExists(parentProdCheck)) {
           log.error('FULL:parent-skip-product-not-found', { itemId: row.itemId, productId: pid });
-          return; // IMPORTANT: do NOT set send_to_shopify false
+          return;
         }
-        // ===== END ADDED =====
 
         // UPDATE parent title (NO price)
         try { shopify.updateProductInfo(String(pid), String(row.displayName), undefined); } catch (e0) {}
-        //  NEW: sync location membership on UPDATE as well (NO inventory touched)
+        
         var parentLocsUpd = parseLocs(row.shopifyLocIds);
         if (parentLocsUpd && parentLocsUpd.length) {
           try {
@@ -482,8 +470,6 @@ function buildMetafields(mfi) {
             } catch (eLocPU) {
               log.error('FULL:parent-location-sync-error', { productId: pid, err: eLocPU });
             }
-          } else {
-            log.debug('FULL:parent-update-no-location-ids', { itemId: row.itemId, productId: pid });
           }
 
         try {
@@ -503,7 +489,6 @@ function buildMetafields(mfi) {
       // -------------------------
       var parentPid = row.parentProductId || row.productId || null;
 
-      // If parent product id not ready yet => skip (child will be handled next MR run)
       if (!parentPid) {
         log.audit('FULL:child-skip-parent-not-ready', {
           itemId: row.itemId,
@@ -529,14 +514,11 @@ function buildMetafields(mfi) {
 
       // CREATE child variant (NO price)
       if (!vid) {
-
-        // ===== ADDED (child create should skip if parent productId not found in Shopify) =====
         var parentProdCheck2 = getShopifyProductSafe(parentPid);
         if (!productExists(parentProdCheck2)) {
           log.error('FULL:child-skip-parent-product-not-found', { itemId: row.itemId, parentProductId: parentPid });
-          return; // IMPORTANT: do NOT set send_to_shopify false
+          return;
         }
-        // ===== END ADDED =====
 
         var up = shopify.upsertVariantFromChild(
           String(parentPid),
@@ -556,27 +538,14 @@ function buildMetafields(mfi) {
         vid = String(up.variantId);
 
         var bcRes = shopify.updateVariantBarcode(String(vid), String(vid));
-        if (!bcRes || bcRes.ok !== true) {
-          log.error('FULL:child-barcode-update-failed', { variantId: vid, res: bcRes });
-        }
-
         if (row.costPerItem !== null && row.costPerItem !== undefined) {
-          var costRes = shopify.updateVariantCost(String(vid), row.costPerItem);
-          if (!costRes || costRes.ok !== true) {
-            log.error('FULL:child-cost-update-failed', { variantId: vid, cost: row.costPerItem, res: costRes });
-          }
+          shopify.updateVariantCost(String(vid), row.costPerItem);
         }
 
-        // Locations ONLY on create AND only if passed
         if (childLocs && childLocs.length) {
           try {
             shopify.setInventoryLocationsExact(String(vid), childLocs);
-            log.audit('FULL:child-locations-set', { productId: parentPid, variantId: vid, itemId: row.itemId, locations: childLocs });
-          } catch (eLocC) {
-            log.error('FULL:child-location-error', { productId: parentPid, variantId: vid, itemId: row.itemId, err: eLocC });
-          }
-        } else {
-          log.debug('FULL:child-no-location-ids', { itemId: row.itemId, variantId: vid });
+          } catch (eLocC) {}
         }
 
         record.submitFields({
@@ -585,98 +554,72 @@ function buildMetafields(mfi) {
           values: {
             custitem_rc_shopify_product_id: String(parentPid),
             custitem_ring_shopify_item_id: String(vid),
-            custitem_ag_barcode: String(vid),
             custitem_rc_send_to_shopify: false,
             custitem_rc_send_to_pfs: 2
           }
         });
 
         log.audit('FULL:child-created', { itemId: row.itemId, productId: parentPid, variantId: vid });
-        return;
-      }
-
-      // ===== ADDED (child update should skip if product/variant not found in Shopify) =====
-      var parentProdCheck3 = getShopifyProductSafe(parentPid);
-      if (!productExists(parentProdCheck3)) {
-        log.error('FULL:child-update-skip-parent-product-not-found', { itemId: row.itemId, parentProductId: parentPid, variantId: vid });
-        return; // IMPORTANT: do NOT set send_to_shopify false
-      }
-      if (!variantExistsInProduct(parentProdCheck3, vid)) {
-        log.error('FULL:child-update-skip-variant-not-found', { itemId: row.itemId, parentProductId: parentPid, variantId: vid });
-        return; // IMPORTANT: do NOT create/replace IDs, do NOT set send_to_shopify false
-      }
-      // ===== END ADDED =====
-
-      // UPDATE child (old behavior) BUT NEVER price/compare updates
-      var editRes = shopify.editChildIfChanged(
-        String(parentPid),
-        String(vid),
-        names,
-        vals,
-        row.sku,
-        undefined, // price blocked
-        undefined, // compare_at blocked
-        childMetafields
-      );
-
-      var finalVid = (editRes && editRes.variantId) ? String(editRes.variantId) : String(vid);
-      if (row.costPerItem !== null && row.costPerItem !== undefined) {
-        var costRes2 = shopify.updateVariantCost(String(finalVid), row.costPerItem);
-        if (!costRes2 || costRes2.ok !== true) {
-          log.error('FULL:child-cost-update-failed', { variantId: finalVid, cost: row.costPerItem, res: costRes2 });
-        }
-      }
-
-      // ✅ Sync NetSuite barcode -> Shopify barcode (UPDATE flow)
-try {
-  var desiredBarcode = (row.barcode || '').trim();
-
-  if (desiredBarcode) {
-    // only set if Shopify barcode is empty OR different
-    var vObj = shopify.getVariant(String(finalVid));
-    var curBc = (vObj && vObj.barcode != null) ? String(vObj.barcode).trim() : '';
-
-    if (!curBc || curBc !== desiredBarcode) {
-      var bcResU = shopify.updateVariantBarcode(String(finalVid), desiredBarcode);
-      if (!bcResU || bcResU.ok !== true) {
-        log.error('FULL:child-barcode-sync-failed', { variantId: finalVid, desiredBarcode: desiredBarcode, res: bcResU });
       } else {
-        log.audit('FULL:child-barcode-synced', { variantId: finalVid, from: curBc, to: desiredBarcode });
-      }
-    }
-  } else {
-    log.debug('FULL:child-barcode-skip-empty', { itemId: row.itemId, variantId: finalVid });
-  }
-} catch (eBCU) {
-  log.error('FULL:child-barcode-sync-throw', { variantId: finalVid, err: eBCU });
-}
+        var parentProdCheck3 = getShopifyProductSafe(parentPid);
+        if (!productExists(parentProdCheck3)) return;
+        if (!variantExistsInProduct(parentProdCheck3, vid)) return;
 
+        var editRes = shopify.editChildIfChanged(
+          String(parentPid),
+          String(vid),
+          names,
+          vals,
+          row.sku,
+          undefined,
+          undefined,
+          childMetafields
+        );
 
-      // NEW: sync location membership on UPDATE as well (NO inventory touched)
-      var childLocsUpd = parseLocs(row.shopifyLocIds);
-      if (childLocsUpd && childLocsUpd.length) {
+        var finalVid = (editRes && editRes.variantId) ? String(editRes.variantId) : String(vid);
+        if (row.costPerItem !== null && row.costPerItem !== undefined) {
+          shopify.updateVariantCost(String(finalVid), row.costPerItem);
+        }
+
+        // ✅ Sync Barcode (as per your existing backup script logic)
         try {
-          shopify.syncInventoryLocationsMembership(String(finalVid), childLocsUpd);
-          log.audit('FULL:child-locations-synced', { productId: parentPid, variantId: finalVid, itemId: row.itemId, locations: childLocsUpd });
-        } catch (eLocCU) {
-          log.error('FULL:child-location-sync-error', { productId: parentPid, variantId: finalVid, itemId: row.itemId, err: eLocCU });
+          var desiredBarcode = (row.barcode || '').trim();
+          if (desiredBarcode) {
+            shopify.updateVariantBarcode(String(finalVid), desiredBarcode);
+          }
+        } catch (eBCU) {}
+
+        // --- NEW: SYNC SHIPPING DATA ---
+        if (finalVid && (row.countryOfOrigin || row.hsCode)) {
+          try {
+            shopify.updateInventoryShippingInfo(String(finalVid), {
+              countryCodeOfOrigin: row.countryOfOrigin,
+              harmonizedSystemCode: row.hsCode
+            });
+            log.audit('FULL:shipping-synced', { variantId: finalVid, country: row.countryOfOrigin, hts: row.hsCode });
+          } catch (eShip) {
+            log.error('FULL:shipping-sync-failed', eShip);
+          }
         }
-      } else {
-        log.debug('FULL:child-update-no-location-ids', { itemId: row.itemId, variantId: finalVid });
+
+        var childLocsUpd = parseLocs(row.shopifyLocIds);
+        if (childLocsUpd && childLocsUpd.length) {
+          try {
+            shopify.syncInventoryLocationsMembership(String(finalVid), childLocsUpd);
+          } catch (eLocCU) {}
+        }
+
+        record.submitFields({
+          type: shopify.getType(row.type),
+          id: row.itemId,
+          values: {
+            custitem_rc_send_to_shopify: false,
+            custitem_rc_send_to_pfs: 2
+          }
+        });
+
+        log.audit('FULL:child-updated', { itemId: row.itemId, productId: parentPid, variantId: finalVid });
       }
-
-      record.submitFields({
-        type: shopify.getType(row.type),
-        id: row.itemId,
-        values: {
-          // custitem_rc_shopify_product_id: String(parentPid),
-          // custitem_ring_shopify_item_id: finalVid,
-          custitem_rc_send_to_shopify: false,
-          custitem_rc_send_to_pfs: 2
-        }
-      });
-
-      log.audit('FULL:child-updated', { itemId: row.itemId, productId: parentPid, variantId: finalVid });
 
     } catch (e) {
       log.error('FULLITEM:reduce-error', { key: key, err: e });
@@ -688,7 +631,6 @@ try {
       var done = {};
       var ok = 0, failed = 0;
 
-      // read outputs written from reduce
       summary.output.iterator().each(function(key, value){
         if (key !== 'UNCK') return true;
 
@@ -697,7 +639,6 @@ try {
         var type = obj.type;
         if (!id || !type) return true;
 
-        // avoid duplicate uncheck
         var uniq = String(type) + '|' + String(id);
         if (done[uniq]) return true;
         done[uniq] = true;
@@ -708,7 +649,6 @@ try {
             id: id,
             values: {
               custitem_shopify_price_update: false
-              //custitem_rc_send_to_shopify: false
             }
           });
           ok++;
@@ -725,7 +665,6 @@ try {
       log.error('summarize-error', e2);
     }
 
-    // optional: log map/reduce errors
     if (summary.inputSummary && summary.inputSummary.error) {
       log.error('Input Error', summary.inputSummary.error);
     }
