@@ -2,27 +2,151 @@
  * @NApiVersion 2.1
  * @NScriptType MapReduceScript
  */
-define(['N/search', 'N/record', 'N/log', 'N/runtime', 'N/task'], function(search, record, log, runtime, task) {
+define(['N/file', 'N/search', 'N/log'], function (file, search, log) {
 
-    var RECORD_TYPE = 'customrecord_inventory_snapshot_entry';
-    var DATE_FIELD = 'custrecord_rc_ins_date';
-    var CUT_OFF_DATE = '03/16/2026';
-    var MAX_RECORDS = 50000;
+    var FOLDER_ID = 2249;
 
     function getInputData() {
-        var results = [];
-        var totalLoaded = 0;
+        var inputFileId = getLatestCsvFileFromFolder();
 
-        var recSearch = search.create({
-            type: RECORD_TYPE,
+        if (!inputFileId) {
+            throw 'No CSV file found in folder ' + FOLDER_ID;
+        }
+
+        var csvFile = file.load({ id: inputFileId });
+        var contents = csvFile.getContents();
+        var lines = contents.split(/\r?\n/);
+
+        var data = [];
+
+        for (var i = 1; i < lines.length; i++) {
+            if (!lines[i] || lines[i].trim() === '') continue;
+
+            var cols = parseCSVLine(lines[i]);
+
+            data.push({
+                lineNo: i,
+                line: lines[i],
+                pfsItemNumber: cols[0] || '',
+                fileBarcode: cols[3] || ''
+            });
+        }
+
+        log.audit('Input File ID', inputFileId);
+        log.audit('Total Rows', data.length);
+
+        return data;
+    }
+
+    function map(context) {
+        var row = JSON.parse(context.value);
+
+        var pfsItemNumber = trimValue(row.pfsItemNumber);
+        var fileBarcode = trimValue(row.fileBarcode);
+
+        var nsBarcode = '';
+        var status = '';
+        var errorMsg = '';
+
+        try {
+            if (!pfsItemNumber) {
+                status = 'ERROR';
+                errorMsg = 'PFS Item Number is empty';
+            } else {
+                var itemInfo = findItemBarcode(pfsItemNumber);
+
+                if (!itemInfo.found) {
+                    status = 'ITEM NOT FOUND';
+                    errorMsg = 'No item found for PFS Item Number: ' + pfsItemNumber;
+                } else {
+                    nsBarcode = trimValue(itemInfo.barcode);
+                    status = nsBarcode === fileBarcode ? 'MATCHED' : 'NOT MATCHED';
+                }
+            }
+        } catch (e) {
+            status = 'ERROR';
+            errorMsg = e.message || e.toString();
+        }
+
+        context.write({
+            key: row.lineNo,
+            value: {
+                line: row.line,
+                nsBarcode: nsBarcode,
+                status: status,
+                error: errorMsg
+            }
+        });
+    }
+
+    function summarize(summary) {
+        var inputFileId = getLatestCsvFileFromFolder();
+        var inputFile = file.load({ id: inputFileId });
+
+        var lines = inputFile.getContents().split(/\r?\n/);
+        var header = parseCSVLine(lines[0]);
+
+        header.push('NetSuite Barcode');
+        header.push('Match Status');
+        header.push('Error');
+
+        var resultByLine = {};
+
+        summary.output.iterator().each(function (key, value) {
+            resultByLine[key] = JSON.parse(value);
+            return true;
+        });
+
+        var outputLines = [];
+        outputLines.push(toCSVLine(header));
+
+        for (var i = 1; i < lines.length; i++) {
+            if (!lines[i] || lines[i].trim() === '') continue;
+
+            var cols = parseCSVLine(lines[i]);
+            var result = resultByLine[i];
+
+            if (result) {
+                cols.push(result.nsBarcode || '');
+                cols.push(result.status || '');
+                cols.push(result.error || '');
+            } else {
+                cols.push('');
+                cols.push('ERROR');
+                cols.push('No result returned from Map stage');
+            }
+
+            outputLines.push(toCSVLine(cols));
+        }
+
+        var outputFile = file.create({
+            name: 'barcode_validation_result_' + getDateTimeStamp() + '.csv',
+            fileType: file.Type.CSV,
+            contents: outputLines.join('\n'),
+            folder: FOLDER_ID
+        });
+
+        var outputFileId = outputFile.save();
+
+        log.audit('Output File Created', outputFileId);
+
+        summary.mapSummary.errors.iterator().each(function (key, error) {
+            log.error('Map Error Line ' + key, error);
+            return true;
+        });
+    }
+
+    function getLatestCsvFileFromFolder() {
+        var latestFileId = '';
+
+        var fileSearch = search.create({
+            type: 'file',
             filters: [
-                [DATE_FIELD, 'before', CUT_OFF_DATE]
+                ['folder', 'anyof', FOLDER_ID],
+                'AND',
+                ['filetype', 'anyof', 'CSV']
             ],
             columns: [
-                search.createColumn({
-                    name: DATE_FIELD,
-                    sort: search.Sort.DESC
-                }),
                 search.createColumn({
                     name: 'internalid',
                     sort: search.Sort.DESC
@@ -30,110 +154,127 @@ define(['N/search', 'N/record', 'N/log', 'N/runtime', 'N/task'], function(search
             ]
         });
 
-        var pagedData = recSearch.runPaged({ pageSize: 1000 });
+        var results = fileSearch.run().getRange({
+            start: 0,
+            end: 1
+        });
 
-        for (var p = 0; p < pagedData.pageRanges.length; p++) {
-            if (totalLoaded >= MAX_RECORDS) {
-                break;
-            }
+        if (results && results.length > 0) {
+            latestFileId = results[0].getValue({ name: 'internalid' });
+        }
 
-            var page = pagedData.fetch({ index: p });
+        return latestFileId;
+    }
 
-            for (var i = 0; i < page.data.length; i++) {
-                if (totalLoaded >= MAX_RECORDS) {
-                    break;
+    function findItemBarcode(pfsItemNumber) {
+        var obj = {
+            found: false,
+            barcode: ''
+        };
+
+        var itemSearch = search.create({
+            type: search.Type.ITEM,
+            filters: [
+                ['custitem_ring_shopify_item_id', 'is', pfsItemNumber],
+                'AND',
+                ['isinactive', 'is', 'F']
+            ],
+            columns: [
+                search.createColumn({ name: 'custitem_ag_barcode' })
+            ]
+        });
+
+        var results = itemSearch.run().getRange({
+            start: 0,
+            end: 1
+        });
+
+        if (results && results.length > 0) {
+            obj.found = true;
+            obj.barcode = results[0].getValue({
+                name: 'custitem_ag_barcode'
+            }) || '';
+        }
+
+        return obj;
+    }
+
+    function parseCSVLine(line) {
+        var result = [];
+        var current = '';
+        var insideQuotes = false;
+
+        line = line || '';
+
+        for (var i = 0; i < line.length; i++) {
+            var ch = line[i];
+
+            if (ch === '"') {
+                if (insideQuotes && line[i + 1] === '"') {
+                    current += '"';
+                    i++;
+                } else {
+                    insideQuotes = !insideQuotes;
                 }
-
-                results.push(page.data[i].id);
-                totalLoaded++;
+            } else if (ch === ',' && !insideQuotes) {
+                result.push(current);
+                current = '';
+            } else {
+                current += ch;
             }
         }
 
-        log.audit('Delete Batch Prepared', {
-            cutOffDate: CUT_OFF_DATE,
-            maxRecords: MAX_RECORDS,
-            loadedForDeletion: results.length,
-            deleteOrder: 'Most recent records before cutoff date first'
-        });
-
-        return results;
+        result.push(current);
+        return result;
     }
 
-    function map(context) {
-        var recId = context.value;
+    function toCSVLine(arr) {
+        var output = [];
 
-        try {
-            record.delete({
-                type: RECORD_TYPE,
-                id: recId
-            });
+        for (var i = 0; i < arr.length; i++) {
+            var value = arr[i];
 
-            context.write({
-                key: 'deleted',
-                value: '1'
-            });
+            if (value == null) value = '';
 
-        } catch (e) {
-            log.error('Delete Error for Record ID ' + recId, e);
+            value = String(value);
 
-            context.write({
-                key: 'error',
-                value: recId
-            });
+            if (value.indexOf('"') !== -1) {
+                value = value.replace(/"/g, '""');
+            }
+
+            if (
+                value.indexOf(',') !== -1 ||
+                value.indexOf('"') !== -1 ||
+                value.indexOf('\n') !== -1 ||
+                value.indexOf('\r') !== -1
+            ) {
+                value = '"' + value + '"';
+            }
+
+            output.push(value);
         }
+
+        return output.join(',');
     }
 
-    function summarize(summary) {
-        var deletedCount = 0;
-        var errorCount = 0;
+    function trimValue(value) {
+        if (value == null) return '';
+        return String(value).trim();
+    }
 
-        if (summary.inputSummary.error) {
-            log.error('Input Error', summary.inputSummary.error);
-        }
+    function getDateTimeStamp() {
+        var d = new Date();
 
-        summary.mapSummary.errors.iterator().each(function(key, error) {
-            errorCount++;
-            log.error('Map Error for Key: ' + key, error);
-            return true;
-        });
+        return d.getFullYear() +
+            pad(d.getMonth() + 1) +
+            pad(d.getDate()) + '_' +
+            pad(d.getHours()) +
+            pad(d.getMinutes()) +
+            pad(d.getSeconds());
+    }
 
-        summary.output.iterator().each(function(key, value) {
-            if (key === 'deleted') {
-                deletedCount += parseInt(value, 10) || 0;
-            } else if (key === 'error') {
-                errorCount++;
-            }
-            return true;
-        });
-
-        log.audit('Deletion Summary', {
-            cutoffDate: CUT_OFF_DATE,
-            deleted: deletedCount,
-            errors: errorCount
-        });
-
-        if (deletedCount >= MAX_RECORDS) {
-            try {
-                var mrTask = task.create({
-                    taskType: task.TaskType.MAP_REDUCE,
-                    scriptId: runtime.getCurrentScript().id,
-                    deploymentId: runtime.getCurrentScript().deploymentId
-                });
-
-                var taskId = mrTask.submit();
-
-                log.audit('Map/Reduce Resubmitted', {
-                    taskId: taskId,
-                    cutOffDate: CUT_OFF_DATE,
-                    maxRecords: MAX_RECORDS
-                });
-
-            } catch (e) {
-                log.error('Resubmit Error', e);
-            }
-        } else {
-            log.audit('Auto Resubmit Stopped', 'Less than batch size deleted, likely no more matching records remain.');
-        }
+    function pad(n) {
+        return n < 10 ? '0' + n : String(n);
     }
 
     return {
